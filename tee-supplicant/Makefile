@@ -51,6 +51,9 @@ endif
 ifeq ($(RPMB_EMU),1)
 TEES_CFLAGS	+= -DRPMB_EMU=1
 endif
+ifeq ($(RPMB_EMU_PERSIST),1)
+TEES_CFLAGS	+= -DRPMB_EMU_PERSIST=1
+endif
 ifeq ($(CFG_TA_TEST_PATH),y)
 TEES_CFLAGS	+= -DCFG_TA_TEST_PATH=1
 endif

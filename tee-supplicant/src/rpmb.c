@@ -45,6 +45,7 @@
 #ifdef RPMB_EMU
 #include <stdarg.h>
 #include "hmac_sha2.h"
+#include <sys/mman.h>
 #else
 #include <errno.h>
 #endif
@@ -235,6 +236,8 @@ err:
 
 #define IOCTL(fd, request, ...) ioctl_emu((fd), (request), ##__VA_ARGS__)
 
+#define MMC_DEV_FD 0xFFAA
+
 /* Emulated rel_wr_sec_c value (reliable write size, *256 bytes) */
 #define EMU_RPMB_REL_WR_SEC_C	1
 /* Emulated rpmb_size_mult value (RPMB size, *128 kB) */
@@ -242,27 +245,39 @@ err:
 
 #define EMU_RPMB_SIZE_BYTES	(EMU_RPMB_SIZE_MULT * 128 * 1024)
 
+/* Chosen with 4294967296 side dice. Guaranteed to be random*/
+#define EMU_RPMB_MAGIC 0x1FD6E23C
+
 /* Emulated eMMC device state */
 struct rpmb_emu {
-	uint8_t buf[EMU_RPMB_SIZE_BYTES];
-	size_t size;
+#ifdef RPMB_EMU_PERSIST
+	uint32_t magic;
+#endif
 	uint8_t key[32];
 	bool key_set;
 	uint8_t nonce[16];
 	uint32_t write_counter;
+	size_t size;
 	struct {
 		uint16_t msg_type;
 		uint16_t op_result;
 		uint16_t address;
 	} last_op;
+	uint8_t buf[EMU_RPMB_SIZE_BYTES];
 };
+#ifndef RPMB_EMU_PERSIST
 static struct rpmb_emu rpmb_emu = {
 	.size = EMU_RPMB_SIZE_BYTES
 };
+#endif
 
 static struct rpmb_emu *mem_for_fd(int fd)
 {
 	static int sfd = -1;
+	static struct rpmb_emu *mem = NULL;
+
+	if (fd == MMC_DEV_FD)
+		return NULL;
 
 	if (sfd == -1)
 		sfd = fd;
@@ -270,8 +285,29 @@ static struct rpmb_emu *mem_for_fd(int fd)
 		EMSG("Emulating more than 1 RPMB partition is not supported");
 		return NULL;
 	}
+#ifdef RPMB_EMU_PERSIST
+	if (mem)
+		return mem;
 
-	return &rpmb_emu;
+	mem = mmap(0, sizeof(struct rpmb_emu), PROT_READ | PROT_WRITE,
+		   MAP_PRIVATE, fd, 0);
+
+	if (!mem) {
+		EMSG("Cant mmap rpmbemul partition");
+		exit(1);
+	}
+
+	if (mem->magic != EMU_RPMB_MAGIC) {
+		IMSG("RPMB-EMU: Invalid magic. Reseting state\n");
+		memset(mem, 0,  sizeof(struct rpmb_emu));
+
+		mem->magic = EMU_RPMB_MAGIC;
+		mem->size = EMU_RPMB_SIZE_BYTES;
+	}
+#else
+	mem = &rpmb_emu;
+#endif
+	return mem;
 }
 
 #if (DEBUGLEVEL >= TRACE_FLOW)
@@ -501,12 +537,13 @@ static int ioctl_emu(int fd, unsigned long request, ...)
 		EMSG("Unsupported ioctl: 0x%lx", request);
 		return -1;
 	}
-	if (!mem)
-		return -1;
 
 	va_start(ap, request);
 	cmd = va_arg(ap, struct mmc_ioc_cmd *);
 	va_end(ap);
+
+	if (!mem && cmd->opcode != MMC_SEND_EXT_CSD)
+		return -1;
 
 	switch (cmd->opcode) {
 	case MMC_SEND_EXT_CSD:
@@ -540,6 +577,9 @@ static int ioctl_emu(int fd, unsigned long request, ...)
 		default:
 			break;
 		}
+#ifdef RPMB_EMU_PERSIST
+		msync(mem, sizeof(*mem), MS_SYNC);
+#endif
 		break;
 
 	case MMC_READ_MULTIPLE_BLOCK:
@@ -567,6 +607,9 @@ static int ioctl_emu(int fd, unsigned long request, ...)
 			EMSG("Unexpected");
 			break;
 		}
+#ifdef RPMB_EMU_PERSIST
+		msync(mem, sizeof(*mem), MS_SYNC);
+#endif
 		break;
 
 	default:
@@ -579,17 +622,33 @@ static int ioctl_emu(int fd, unsigned long request, ...)
 
 static int mmc_rpmb_fd(uint16_t dev_id)
 {
-	(void)dev_id;
+	static int fd = -1;
 
+	(void)dev_id;
+	if (fd >= 0)
+		return fd;
+#ifdef RPMB_EMU_PERSIST
+#ifdef __ANDROID__
+	fd = open("/dev/block/by-name//rpmbemul", O_RDWR);
+#else  /* __ANDROID__ */
+	fd = open("/dev/disk/by-partlabel/rpmbemul", O_RDWR);
+#endif	/* __ANDROID__ */
+	if (fd < 0)
+		EMSG("Can't find rpmbemul partition");
+
+#else  /* RPMB_EMU_PERSIST */
 	/* Any value != -1 will do in test mode */
-	return 0;
+	fd = 0;
+#endif	/* RPMB_EMU_PERSIST */
+
+	return fd;
 }
 
 static int mmc_fd(uint16_t dev_id)
 {
 	(void)dev_id;
 
-	return 0;
+	return MMC_DEV_FD;
 }
 
 static void close_mmc_fd(int fd)
